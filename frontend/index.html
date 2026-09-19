@@ -13,7 +13,7 @@
       <span class="brand-mark">📐</span>
       <div class="brand-text">
         <h1>平面照片标尺校准</h1>
-        <span class="brand-sub">单应矩阵透视校正 · 闭合多边形面积 / 周长</span>
+        <span class="brand-sub">单应矩阵透视校正 · 含镂空孔洞的面积 / 周长</span>
       </div>
     </div>
     <div class="top-actions">
@@ -109,13 +109,15 @@
         </div>
         <div class="panel-body">
           <div class="mode-row">
-            <button class="btn btn-mode" id="modeDraw" disabled>✏ 绘制</button>
+            <button class="btn btn-mode" id="modeDraw" disabled>✏ 绘制外环</button>
+            <button class="btn btn-mode" id="modeHole" disabled title="在已闭合的外环内绘制镂空孔洞">▰ 镂空孔洞</button>
             <button class="btn btn-mode" id="modeEdit" disabled>↔ 编辑</button>
             <button class="btn btn-ghost" id="modeDrawAnother" disabled title="保留已有区域并绘制下一个多边形">＋ 再画一个</button>
             <button class="btn btn-ghost danger" id="clearPolys" disabled>清空区域</button>
           </div>
           <p class="tip">绘制模式下逐点单击，<b>双击 / Enter</b> 闭合；Esc 取消，Backspace 撤销顶点。
-            编辑模式可拖动顶点、拖动区域整体、右键删除顶点。</p>
+            选中区域后点「镂空孔洞」（或按 <b>5</b>）在其外环内部绘制孔洞：孔洞必须完全位于外环内，
+            且孔洞与外环、孔洞之间<b>不得相交或相切</b>。编辑模式可拖动外环/孔洞顶点、整体拖动区域、右键删除顶点。</p>
         </div>
       </section>
 

@@ -101,6 +101,7 @@ h1, h2 { margin: 0; font-weight: 600; }
   touch-action: none;
 }
 #canvas.mode-draw { cursor: crosshair; }
+#canvas.mode-hole { cursor: crosshair; }
 #canvas.mode-edit { cursor: default; }
 #canvas.mode-calib { cursor: crosshair; }
 #canvas.mode-pan, #canvas.panning { cursor: grabbing; }
@@ -363,6 +364,60 @@ input[type="number"]:focus, select:focus { border-color: var(--accent); }
   line-height: 1.5;
 }
 .poly-meta { font-size: 10.5px; color: var(--text-dim); font-family: var(--mono); margin-top: 6px; }
+
+.hole-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.hole-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg-3);
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.hole-badge { font-weight: 700; white-space: nowrap; }
+.hole-stats {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hole-del {
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font-size: 11px; padding: 1px 5px; border-radius: 5px;
+}
+.hole-del:hover { color: var(--red); background: rgba(255,107,107,.12); }
+
+.poly-actions { display: flex; margin-top: 6px; }
+.poly-actions .btn { font-size: 11.5px; padding: 4px 10px; }
+
+.last-valid {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 7px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: #1d2a22;
+  border: 1px solid #33543f;
+  font-size: 10.5px;
+  color: #bfe6cf;
+  font-family: var(--mono);
+}
+.last-valid b { color: #eafff3; }
+.last-valid .btn {
+  font-size: 11px;
+  padding: 3px 9px;
+  white-space: nowrap;
+  border-color: #33544f;
+  color: #bfe6cf;
+}
+.last-valid .btn:hover { border-color: var(--green); color: #fff; }
 
 .toast {
   position: fixed;

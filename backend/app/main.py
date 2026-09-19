@@ -16,14 +16,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from .geometry import HomographyResult, measure_polygon, solve_homography
+from .geometry import HomographyResult, measure_region, solve_homography
 
 BASE_DIR = Path(__file__).resolve().parent
 # backend/app/main.py -> parents: backend/, workspace/
@@ -58,6 +57,10 @@ def _load_sessions() -> None:
     for f in SESS_DIR.glob("*.json"):
         try:
             s = json.loads(f.read_text(encoding="utf-8"))
+            # Backward compatibility: sessions saved before holes existed have
+            # no "holes" key on polygon records.
+            for poly in s.get("polygons", []):
+                poly.setdefault("holes", [])
             _SESSIONS[s["id"]] = s
         except (json.JSONDecodeError, KeyError):
             continue
@@ -89,13 +92,23 @@ class CalibrationIn(BaseModel):
     unit: str = Field("mm", min_length=1, max_length=16)
 
 
+MAX_HOLES = 50
+MAX_RING_POINTS = 2000
+
+
+class RingIn(BaseModel):
+    points: list[Point] = Field(..., min_length=1, max_length=MAX_RING_POINTS)
+
+
 class PolygonIn(BaseModel):
-    points: list[Point] = Field(..., min_length=1, max_length=2000)
+    points: list[Point] = Field(..., min_length=1, max_length=MAX_RING_POINTS)
+    holes: list[RingIn] | None = Field(None, max_length=MAX_HOLES)
     name: str | None = Field(None, max_length=80)
 
 
 class PolygonPatch(BaseModel):
-    points: list[Point] = Field(..., min_length=1, max_length=2000)
+    points: list[Point] = Field(..., min_length=1, max_length=MAX_RING_POINTS)
+    holes: list[RingIn] | None = Field(None, max_length=MAX_HOLES)
     name: str | None = Field(None, max_length=80)
 
 
@@ -114,27 +127,60 @@ def _cal_payload(s: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _holes_payload(poly: dict[str, Any], r) -> list[dict[str, Any]]:
+    """Per-hole response entries (geometry always mirrors what is stored)."""
+    stored = poly.get("holes", [])
+    if not (r is not None and r.ok and r.hole_world_points is not None):
+        return [
+            {
+                "index": k + 1,
+                "points": h["points"],
+                "world_points": None,
+                "area": None,
+                "perimeter": None,
+            }
+            for k, h in enumerate(stored)
+        ]
+    return [
+        {
+            "index": k + 1,
+            "points": h["points"],
+            "world_points": [{"x": float(w[0]), "y": float(w[1])} for w in r.hole_world_points[k]],
+            "area": r.hole_areas[k],
+            "perimeter": r.hole_perimeters[k],
+        }
+        for k, h in enumerate(stored)
+    ]
+
+
 def _measure_payload(poly: dict[str, Any], cal: dict[str, Any] | None) -> dict[str, Any]:
     pts = [[p["x"], p["y"]] for p in poly["points"]]
-    out = {
+    holes_img = [[[p["x"], p["y"]] for p in h["points"]] for h in poly.get("holes", [])]
+    out: dict[str, Any] = {
         "id": poly["id"],
         "name": poly["name"],
         "points": poly["points"],
+        "holes": None,  # filled below
         "valid": False,
         "area": None,
         "perimeter": None,
+        "gross_area": None,
         "world_points": None,
         "errors": ["尚未完成透视校准"],
     }
     if cal and cal.get("valid") and cal.get("H"):
-        r = measure_polygon(cal["H"], pts)
+        r = measure_region(cal["H"], pts, holes_img)
         out.update(
             valid=r.ok,
             area=r.area,
             perimeter=r.perimeter,
+            gross_area=r.gross_area,
             world_points=r.world_points,
             errors=r.errors or [],
         )
+        out["holes"] = _holes_payload(poly, r)
+    else:
+        out["holes"] = _holes_payload(poly, None)
     return out
 
 
@@ -248,48 +294,98 @@ def set_calibration(sid: str, body: CalibrationIn) -> dict[str, Any]:
 # Polygons
 # ---------------------------------------------------------------------------
 
-def _validate_points_in_image(s: dict[str, Any], points: list[Point]) -> None:
+def _validate_points_in_image(s: dict[str, Any], points: list[Point], what: str = "顶点") -> None:
     img_w, img_h = s["image"]["width"], s["image"]["height"]
     for i, p in enumerate(points):
         if not (math.isfinite(p.x) and math.isfinite(p.y)):
-            raise HTTPException(status_code=400, detail=f"顶点 {i + 1} 坐标非法")
+            raise HTTPException(status_code=400, detail=f"{what} {i + 1} 坐标非法")
         if not (-1 <= p.x <= img_w + 1 and -1 <= p.y <= img_h + 1):
-            raise HTTPException(status_code=400, detail=f"顶点 {i + 1} 超出图像范围")
+            raise HTTPException(status_code=400, detail=f"{what} {i + 1} 超出图像范围")
+
+
+def _rings_from_body(body: PolygonIn | PolygonPatch) -> tuple[list[dict[str, float]], list[list[dict[str, float]]]]:
+    outer = [{"x": p.x, "y": p.y} for p in body.points]
+    holes = [[{"x": q.x, "y": q.y} for q in ring.points] for ring in (body.holes or [])]
+    return outer, holes
+
+
+def _conflict_response(poly: dict[str, Any], cal: dict[str, Any] | None) -> JSONResponse:
+    """422 with the conflict detail and the last valid server-side result."""
+    m = _measure_payload(poly, cal)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "非法几何：" + "；".join(m["errors"]), "polygon": m},
+    )
 
 
 @app.post("/api/sessions/{sid}/polygons")
-def add_polygon(sid: str, body: PolygonIn) -> dict[str, Any]:
+def add_polygon(sid: str, body: PolygonIn) -> JSONResponse:
     s = _get(sid)
     if not s.get("image"):
         raise HTTPException(status_code=400, detail="请先上传照片")
     if len(s["polygons"]) >= 200:
         raise HTTPException(status_code=400, detail="每个会话最多保留 200 个区域")
+    if len(body.holes or []) > MAX_HOLES:
+        raise HTTPException(status_code=400, detail=f"每个区域最多 {MAX_HOLES} 个孔洞")
     _validate_points_in_image(s, body.points)
+    for hi, ring in enumerate(body.holes or [], start=1):
+        _validate_points_in_image(s, ring.points, what=f"孔洞 {hi} 顶点")
+    outer, holes = _rings_from_body(body)
+    cal = s.get("calibration")
+    # With a valid calibration, the new region must itself be a valid region.
+    if cal and cal.get("valid") and cal.get("H"):
+        check = measure_region(
+            cal["H"],
+            [[p["x"], p["y"]] for p in outer],
+            [[[p["x"], p["y"]] for p in h] for h in holes],
+        )
+        if not check.ok:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "非法几何：" + "；".join(check.errors or []), "polygon": None},
+            )
     name = (body.name or f"区域 {len(s['polygons']) + 1}").strip()[:80]
     poly = {
         "id": uuid.uuid4().hex,
         "name": name or f"区域 {len(s['polygons']) + 1}",
-        "points": [{"x": p.x, "y": p.y} for p in body.points],
+        "points": outer,
+        "holes": holes,
     }
     s["polygons"].append(poly)
     with _LOCK:
         _save_session(s)
-    return {"polygon": _measure_payload(poly, s.get("calibration"))}
+    return JSONResponse({"polygon": _measure_payload(poly, cal)})
 
 
 @app.put("/api/sessions/{sid}/polygons/{pid}")
-def update_polygon(sid: str, pid: str, body: PolygonPatch) -> dict[str, Any]:
+def update_polygon(sid: str, pid: str, body: PolygonPatch) -> JSONResponse:
     s = _get(sid)
+    if len(body.holes or []) > MAX_HOLES:
+        raise HTTPException(status_code=400, detail=f"每个区域最多 {MAX_HOLES} 个孔洞")
     _validate_points_in_image(s, body.points)
-    for poly in s["polygons"]:
-        if poly["id"] == pid:
-            poly["points"] = [{"x": p.x, "y": p.y} for p in body.points]
-            if body.name:
-                poly["name"] = body.name
-            with _LOCK:
-                _save_session(s)
-            return {"polygon": _measure_payload(poly, s.get("calibration"))}
-    raise HTTPException(status_code=404, detail="多边形不存在")
+    for hi, ring in enumerate(body.holes or [], start=1):
+        _validate_points_in_image(s, ring.points, what=f"孔洞 {hi} 顶点")
+    target = next((p for p in s["polygons"] if p["id"] == pid), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="多边形不存在")
+    cal = s.get("calibration")
+    outer, holes = _rings_from_body(body)
+    if cal and cal.get("valid") and cal.get("H"):
+        check = measure_region(
+            cal["H"],
+            [[p["x"], p["y"]] for p in outer],
+            [[[p["x"], p["y"]] for p in h] for h in holes],
+        )
+        if not check.ok:
+            # Do NOT overwrite the last valid server-side geometry/result.
+            return _conflict_response(target, cal)
+    target["points"] = outer
+    target["holes"] = holes
+    if body.name:
+        target["name"] = body.name
+    with _LOCK:
+        _save_session(s)
+    return JSONResponse({"polygon": _measure_payload(target, cal)})
 
 
 @app.delete("/api/sessions/{sid}/polygons/{pid}")
@@ -321,12 +417,23 @@ def clear_polygons(sid: str) -> dict[str, Any]:
 def export_session(sid: str) -> JSONResponse:
     s = _get(sid)
     cal = s.get("calibration")
-    H = np.asarray(cal["H"]) if cal and cal.get("H") else None
     polygons = []
     all_ok = bool(s.get("image")) and bool(cal and cal.get("valid"))
     for idx, poly in enumerate(s["polygons"], start=1):
         m = _measure_payload(poly, cal)
         all_ok = all_ok and m["valid"]
+        holes_out = []
+        for hk, h in enumerate(m["holes"] or []):
+            holes_out.append({
+                "index": hk + 1,
+                "image_points": [{"u": p["x"], "v": p["y"]} for p in h["points"]],
+                "world_points": (
+                    [{"x": round(w["x"], 9), "y": round(w["y"], 9)} for w in h["world_points"]]
+                    if h["world_points"] else None
+                ),
+                "area": round(h["area"], 9) if h["area"] is not None else None,
+                "perimeter": round(h["perimeter"], 9) if h["perimeter"] is not None else None,
+            })
         polygons.append({
             "id": poly["id"],
             "name": poly["name"],
@@ -337,7 +444,9 @@ def export_session(sid: str) -> JSONResponse:
                 if m["world_points"] else None
             ),
             "area": (round(m["area"], 9) if m["area"] is not None else None),
+            "gross_area": (round(m["gross_area"], 9) if m["gross_area"] is not None else None),
             "perimeter": (round(m["perimeter"], 9) if m["perimeter"] is not None else None),
+            "holes": holes_out,
             "valid": m["valid"],
             "errors": m["errors"],
         })

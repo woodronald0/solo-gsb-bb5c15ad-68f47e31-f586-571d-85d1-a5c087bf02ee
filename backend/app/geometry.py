@@ -31,6 +31,7 @@ MIN_PIVOT = 1e-9        # least-squares pivot threshold (singular DLT)
 RESIDUAL_TOL = 1e-7     # max normalized DLT residual
 H_DET_TOL = 1e-8        # |det H| relative to |H|^3
 DENOM_TOL = 1e-9        # |w| / |H row 3| for mapping through infinity
+RING_TOL = 1e-9         # ring separation / tangency tolerance (relative to size)
 
 _EPS = 1e-12
 
@@ -265,39 +266,295 @@ class MeasurementResult:
     perimeter: float | None = None
     world_points: list[list[float]] | None = None
     errors: list[str] | None = None
+    # Region-with-holes extras (None for a plain polygon / on failure).
+    hole_areas: list[float] | None = None
+    hole_perimeters: list[float] | None = None
+    hole_world_points: list[list[list[float]]] | None = None
+    gross_area: float | None = None
 
 
 def measure_polygon(H: list[list[float]], image_points: list[list[float]]) -> MeasurementResult:
     """Transform a closed polygon and compute its area/perimeter in real units."""
-    if len(image_points) < 3:
-        return MeasurementResult(False, None, None, None, ["多边形至少需要 3 个顶点"])
+    return measure_region(H, image_points, [])
 
+
+# ---------------------------------------------------------------------------
+# Multi-ring regions (one outer ring + zero or more holes)
+# ---------------------------------------------------------------------------
+
+def _ring_abs_area(points: list[list[float]]) -> float:
+    s = 0.0
+    n = len(points)
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _ring_perimeter(points: list[list[float]]) -> float:
+    p = 0.0
+    n = len(points)
+    for i in range(n):
+        p += float(np.hypot(points[(i + 1) % n][0] - points[i][0],
+                            points[(i + 1) % n][1] - points[i][1]))
+    return p
+
+
+def _point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    abx, aby = float(b[0] - a[0]), float(b[1] - a[1])
+    den = abx * abx + aby * aby
+    if den < _EPS:
+        return float(np.hypot(*(p - a)))
+    t = (float(p[0] - a[0]) * abx + float(p[1] - a[1]) * aby) / den
+    t = min(1.0, max(0.0, t))
+    q = (a[0] + abx * t, a[1] + aby * t)
+    return float(np.hypot(q[0] - p[0], q[1] - p[1]))
+
+
+def _segment_relation(p: np.ndarray, q: np.ndarray,
+                      a: np.ndarray, b: np.ndarray, tol: float) -> tuple[str, float]:
+    """Classify two closed segments.
+
+    Returns ``(kind, d)`` with kind in {"cross", "near", "far"}:
+
+    * cross — proper intersection, endpoint contact, or collinear overlap;
+    * near  — disjoint but closest approach at/below ``tol`` (near-tangency);
+    * far   — well separated.
+    """
+    def orient(r, s, t):
+        return (s[0] - r[0]) * (t[1] - r[1]) - (s[1] - r[1]) * (t[0] - r[0])
+
+    o1, o2 = orient(p, q, a), orient(p, q, b)
+    o3, o4 = orient(a, b, p), orient(a, b, q)
+    if all(abs(o) <= tol for o in (o1, o2, o3, o4)):
+        def on_seg(x, r, s):
+            return (min(r[0], s[0]) - tol <= x[0] <= max(r[0], s[0]) + tol
+                    and min(r[1], s[1]) - tol <= x[1] <= max(r[1], s[1]) + tol)
+
+        if any(on_seg(z, p, q) and on_seg(z, a, b) for z in (p, q, a, b)):
+            return "cross", 0.0  # collinear overlap
+
+    if ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol)) and \
+       ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol)):
+        return "cross", 0.0
+
+    # Endpoint-on-segment contacts (tangency through a vertex): perpendicular
+    # distance within tol AND the projection lying on the segment itself.
+    def on_segment(z, r, s):
+        edge_len = float(np.hypot(s[0] - r[0], s[1] - r[1]))
+        if edge_len < _EPS:
+            return float(np.hypot(z[0] - r[0], z[1] - r[1])) <= tol
+        cross = abs((s[0] - r[0]) * (z[1] - r[1]) - (s[1] - r[1]) * (z[0] - r[0]))
+        if cross > tol * edge_len:
+            return False
+        return (min(r[0], s[0]) - tol <= z[0] <= max(r[0], s[0]) + tol
+                and min(r[1], s[1]) - tol <= z[1] <= max(r[1], s[1]) + tol)
+
+    if on_segment(a, p, q) or on_segment(b, p, q) \
+            or on_segment(p, a, b) or on_segment(q, a, b):
+        return "cross", 0.0
+
+    d = min(
+        _point_segment_distance(a, p, q),
+        _point_segment_distance(b, p, q),
+        _point_segment_distance(p, a, b),
+        _point_segment_distance(q, a, b),
+    )
+    return ("near" if d <= tol else "far"), float(d)
+
+
+def _point_in_ring(p: np.ndarray, ring: list[np.ndarray]) -> bool:
+    """Strict ray-cast containment; points exactly on the boundary count as out."""
+    inside = False
+    n = len(ring)
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        if (a[1] > p[1]) != (b[1] > p[1]):
+            x_cross = a[0] + (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1])
+            if x_cross > p[0]:
+                inside = not inside
+    return inside
+
+
+def _ring_scale(ring: list[np.ndarray]) -> float:
+    lo = (min(p[0] for p in ring), min(p[1] for p in ring))
+    hi = (max(p[0] for p in ring), max(p[1] for p in ring))
+    return max(float(np.hypot(hi[0] - lo[0], hi[1] - lo[1])), 1.0)
+
+
+def validate_ring_topology(rings: list[list[list[float]]]) -> list[str]:
+    """Validate outer ring + holes in *corrected (real-plane) coordinates*.
+
+    Every ring must be a simple (non-self-intersecting) polygon.  Each hole
+    must lie strictly inside the outer ring; holes must be pairwise strictly
+    separated: crossing, touching (tangent), near-contact (within a relative
+    tolerance) and nesting are all rejected.
+    """
+    if not rings:
+        return []
+    errors: list[str] = []
+
+    def label(ri: int) -> str:
+        return "外环" if ri == 0 else f"孔洞 {ri}"
+
+    for ri, ring in enumerate(rings):
+        if len(ring) < 3:
+            errors.append(label(ri) + "至少需要 3 个顶点")
+            continue
+        hit, reason = polygon_self_intersects(ring)
+        if hit:
+            errors.append(f"{label(ri)}自交（{reason}），请调整顶点")
+
+    if any(len(r) < 3 for r in rings):
+        return errors
+
+    np_rings = [[_point(p) for p in ring] for ring in rings]
+    outer = np_rings[0]
+
+    # outer ring vs each hole ------------------------------------------------
+    for hi in range(1, len(np_rings)):
+        hole = np_rings[hi]
+        tol = RING_TOL * max(_ring_scale(outer), _ring_scale(hole))
+        blocked = False
+        near_d: float | None = None
+        for i in range(len(outer)):
+            p, q = outer[i], outer[(i + 1) % len(outer)]
+            for j in range(len(hole)):
+                a, b = hole[j], hole[(j + 1) % len(hole)]
+                kind, d = _segment_relation(p, q, a, b, tol)
+                if kind == "cross":
+                    errors.append(
+                        f"孔洞 {hi} 与外环相交或相切（外环边 {i + 1} 与孔洞边 {j + 1}），"
+                        "孔洞必须完全位于外环内且与外环边界严格分离"
+                    )
+                    blocked = True
+                    break
+                if kind == "near" and near_d is None:
+                    near_d = d
+            if blocked:
+                break
+        if blocked:
+            continue
+        if near_d is not None:
+            errors.append(
+                f"孔洞 {hi} 与外环距离过近（{near_d:.3g}，判定为相切/越界），"
+                "请将孔洞移入外环内部并与外边界保持距离"
+            )
+            continue
+        for k, z in enumerate(hole):
+            if not _point_in_ring(z, outer):
+                errors.append(f"孔洞 {hi} 没有完全位于外环内（孔洞顶点 {k + 1} 位于外环之外）")
+                break
+
+    # hole vs hole -----------------------------------------------------------
+    for h1 in range(1, len(np_rings)):
+        for h2 in range(h1 + 1, len(np_rings)):
+            r1, r2 = np_rings[h1], np_rings[h2]
+            tol = RING_TOL * max(_ring_scale(r1), _ring_scale(r2))
+            blocked = False
+            near_d = None
+            for i in range(len(r1)):
+                p, q = r1[i], r1[(i + 1) % len(r1)]
+                for j in range(len(r2)):
+                    a, b = r2[j], r2[(j + 1) % len(r2)]
+                    kind, d = _segment_relation(p, q, a, b, tol)
+                    if kind == "cross":
+                        errors.append(
+                            f"孔洞 {h1} 与孔洞 {h2} 相交或相切（边 {i + 1} 与边 {j + 1}），"
+                            "孔洞之间必须严格分离"
+                        )
+                        blocked = True
+                        break
+                    if kind == "near" and near_d is None:
+                        near_d = d
+                if blocked:
+                    break
+            if blocked:
+                continue
+            if near_d is not None:
+                errors.append(
+                    f"孔洞 {h1} 与孔洞 {h2} 距离过近（{near_d:.3g}，判定为相切），请将两个孔洞分开"
+                )
+                continue
+            if _point_in_ring(r2[0], r1):
+                errors.append(f"孔洞 {h2} 位于孔洞 {h1} 内部（孔洞不允许相互包含）")
+            elif _point_in_ring(r1[0], r2):
+                errors.append(f"孔洞 {h1} 位于孔洞 {h2} 内部（孔洞不允许相互包含）")
+
+    return errors
+
+
+def _transform_ring(H: list[list[float]], image_points: list[list[float]],
+                    ring_label: str) -> tuple[list[list[float]] | None, str | None]:
     row3 = np.asarray(H, dtype=float)[2]
     row3_scale = float(np.hypot(row3[0], row3[1]))
     if row3_scale < _EPS:
         row3_scale = abs(float(row3[2]))
-
     world: list[list[float]] = []
     for i, p in enumerate(image_points):
         x, y, w = apply_homography(H, p)
         if abs(w) < DENOM_TOL * max(row3_scale, 1.0):
-            return MeasurementResult(False, None, None, None, [
-                f"多边形顶点 {i + 1} 的透视分母接近 0（位于无穷远线上），无法计算校正后坐标"
-            ])
+            return None, f"{ring_label}顶点 {i + 1} 的透视分母接近 0（位于无穷远线上），无法计算校正后坐标"
         world.append([x / w, y / w])
+    return world, None
 
-    crosses, reason = polygon_self_intersects(world)
-    if crosses:
-        return MeasurementResult(False, None, None, None, [
-            f"多边形自交（{reason}），自交多边形没有唯一的面积，请调整顶点"
-        ])
 
-    n = len(world)
-    area2 = 0.0
-    perimeter = 0.0
-    for i in range(n):
-        x1, y1 = world[i]
-        x2, y2 = world[(i + 1) % n]
-        area2 += x1 * y2 - x2 * y1
-        perimeter += float(np.hypot(x2 - x1, y2 - y1))
-    return MeasurementResult(True, abs(area2) / 2.0, perimeter, world)
+def measure_region(
+    H: list[list[float]],
+    outer_image: list[list[float]],
+    holes_image: list[list[list[float]]] | None = None,
+) -> MeasurementResult:
+    """Measure a region with holes.
+
+    Area is the outer-ring area minus every hole area; perimeter includes
+    the outer boundary plus every hole boundary.  All ring relationships are
+    validated in corrected real-plane coordinates.
+    """
+    holes_image = holes_image or []
+    if len(outer_image) < 3:
+        return MeasurementResult(False, None, None, None, ["多边形至少需要 3 个顶点"])
+
+    rings_world: list[list[list[float]]] = []
+    outer_world, err = _transform_ring(H, outer_image, "多边形")
+    if err:
+        return MeasurementResult(False, None, None, None, [err])
+    rings_world.append(outer_world)
+
+    for hi, hp in enumerate(holes_image, start=1):
+        if len(hp) < 3:
+            return MeasurementResult(False, None, None, None, [f"孔洞 {hi} 至少需要 3 个顶点"])
+        hw, err = _transform_ring(H, hp, f"孔洞 {hi} ")
+        if err:
+            return MeasurementResult(False, None, None, None, [err])
+        rings_world.append(hw)
+
+    topo_errors = validate_ring_topology(rings_world)
+    if topo_errors:
+        return MeasurementResult(False, None, None, None, topo_errors)
+
+    outer = rings_world[0]
+    gross = _ring_abs_area(outer)
+    perimeter = _ring_perimeter(outer)
+    hole_areas: list[float] = []
+    hole_perimeters: list[float] = []
+    for ring in rings_world[1:]:
+        ha = _ring_abs_area(ring)
+        hp_ = _ring_perimeter(ring)
+        hole_areas.append(ha)
+        hole_perimeters.append(hp_)
+        perimeter += hp_
+    area = gross - sum(hole_areas)
+
+    return MeasurementResult(
+        True,
+        area=area,
+        perimeter=perimeter,
+        world_points=outer,
+        errors=[],
+        hole_areas=hole_areas,
+        hole_perimeters=hole_perimeters,
+        hole_world_points=rings_world[1:],
+        gross_area=gross,
+    )

@@ -13,8 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from app.geometry import (  # noqa: E402
     convex_ordered_quad,
     measure_polygon,
+    measure_region,
     polygon_self_intersects,
     solve_homography,
+    validate_ring_topology,
 )
 
 # World -> image: a known, well-conditioned projective transform.
@@ -103,6 +105,67 @@ if res.ok:
     bt_img = [project(0, 0), project(100, 60), project(100, 0), project(0, 60)]
     m = measure_polygon(res.H, bt_img)
     check("self-intersecting polygon blocked", not m.ok and "自交" in m.errors[0])
+
+print("== ring topology (holes, world coords) ==")
+outer = [[0, 0], [100, 0], [100, 60], [0, 60]]
+hole1 = [[20, 10], [40, 10], [40, 30], [20, 30]]
+hole2 = [[60, 20], [80, 20], [80, 40], [60, 40]]
+check("two clean holes ok", validate_ring_topology([outer, hole1, hole2]) == [])
+
+outside = [[105, 65], [120, 65], [120, 80], [105, 80]]
+check("outside hole rejected",
+      any("没有完全位于外环内" in e for e in validate_ring_topology([outer, outside])))
+
+crossing = [[90, 10], [110, 10], [110, 30], [90, 30]]
+check("crossing hole rejected",
+      any("相交或相切" in e for e in validate_ring_topology([outer, crossing])))
+
+# vertex of the hole lies exactly on the outer edge -> tangency rejected
+tangent = [[20, 0], [40, 0], [40, 20], [20, 20]]
+check("tangent hole rejected",
+      any("相切" in e for e in validate_ring_topology([outer, tangent])))
+
+hb1 = [[20, 20], [50, 20], [50, 45], [20, 45]]
+hb2 = [[45, 25], [70, 25], [70, 50], [45, 50]]
+check("inter-hole crossing rejected",
+      any("孔洞 1 与孔洞 2 相交或相切" in e for e in validate_ring_topology([outer, hb1, hb2])))
+
+nested1 = [[20, 10], [80, 10], [80, 50], [20, 50]]
+nested2 = [[40, 20], [60, 20], [60, 40], [40, 40]]
+check("nested holes rejected",
+      any("包含" in e for e in validate_ring_topology([outer, nested1, nested2])))
+
+self_cross_hole = [[20, 10], [40, 30], [40, 10], [20, 30]]
+check("self-crossing hole rejected",
+      any("孔洞 1自交" in e for e in validate_ring_topology([outer, self_cross_hole])))
+
+print("== region measurement with holes (perspective) ==")
+if res.ok:
+    # outer [10,90] x [10,50] -> gross 3200, perimeter 240
+    outer_img = [project(x, y) for x, y in [(10, 10), (90, 10), (90, 50), (10, 50)]]
+    # hole [30,50] x [20,40] -> area 400, perimeter 80
+    hole_img = [project(x, y) for x, y in [(30, 20), (50, 20), (50, 40), (30, 40)]]
+    m = measure_region(res.H, outer_img, [hole_img])
+    check("region valid", m.ok, str(m.errors))
+    check("net area 2800", m.ok and abs(m.area - 2800) < 1e-4, f"area={m.area}")
+    check("gross area 3200", m.ok and abs(m.gross_area - 3200) < 1e-4, f"gross={m.gross_area}")
+    check("hole area 400", m.ok and abs(m.hole_areas[0] - 400) < 1e-4)
+    check("total perimeter 320", m.ok and abs(m.perimeter - 320) < 1e-4, f"p={m.perimeter}")
+
+    # two holes
+    hole2_img = [project(x, y) for x, y in [(60, 20), (80, 20), (80, 40), (60, 40)]]
+    m2 = measure_region(res.H, outer_img, [hole_img, hole2_img])
+    check("two-hole net area 2400", m2.ok and abs(m2.area - 2400) < 1e-4, f"area={m2.area}")
+    check("two-hole perimeter 400", m2.ok and abs(m2.perimeter - 400) < 1e-4)
+
+    # hole straddling the outer edge -> invalid
+    bad_hole = [project(x, y) for x, y in [(80, 40), (95, 40), (95, 55), (80, 55)]]
+    mb = measure_region(res.H, outer_img, [bad_hole])
+    check("straddling hole blocked", not mb.ok and any("外环" in e for e in mb.errors), str(mb.errors))
+
+    # backward-compatible plain wrapper
+    mp = measure_polygon(res.H, outer_img)
+    check("plain wrapper works", mp.ok and abs(mp.area - 3200) < 1e-4)
 
 print()
 if failures:
