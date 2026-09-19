@@ -13,7 +13,7 @@
       <span class="brand-mark">📐</span>
       <div class="brand-text">
         <h1>平面照片标尺校准</h1>
-        <span class="brand-sub">单应矩阵透视校正 · 闭合多边形面积 / 周长</span>
+        <span class="brand-sub">单应矩阵透视校正 · 带镂空孔洞的闭合多边形面积 / 周长</span>
       </div>
     </div>
     <div class="top-actions">
@@ -116,6 +116,9 @@
           </div>
           <p class="tip">绘制模式下逐点单击，<b>双击 / Enter</b> 闭合；Esc 取消，Backspace 撤销顶点。
             编辑模式可拖动顶点、拖动区域整体、右键删除顶点。</p>
+          <p class="tip"><b>镂空孔洞：</b>在测量结果卡片上点击 <b>「◔ 挖洞」</b>，可在已闭合的外环内部继续绘制多个孔洞
+            （琥珀色草稿）。孔洞必须<b>完全位于外环内</b>，与外环、其它孔洞均<b>不得相交或相切</b>；
+            面积按外环减去全部孔洞，周长包含外环与所有孔洞边界。右键孔洞可删除整个孔洞。</p>
         </div>
       </section>
 
@@ -127,7 +130,7 @@
           <select id="displayUnit" class="unit-select" title="结果显示单位"></select>
         </div>
         <div class="panel-body poly-list" id="polyList">
-          <p class="empty-text">完成标定并绘制闭合多边形后，这里实时显示校正后的面积与周长。</p>
+          <p class="empty-text">完成标定并绘制闭合多边形后，这里实时显示校正后的净面积与总周长；可在每个区域上继续「◔ 挖洞」。</p>
         </div>
       </section>
     </aside>

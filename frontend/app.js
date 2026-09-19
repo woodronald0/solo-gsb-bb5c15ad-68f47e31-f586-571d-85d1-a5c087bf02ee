@@ -18,6 +18,8 @@ const GEO = {
   RESIDUAL_TOL: 1e-7,
   H_DET_TOL: 1e-8,
   DENOM_TOL: 1e-9,
+  CONTACT_TOL: 1e-8,
+  ZERO_AREA_TOL: 1e-10,
 };
 
 const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
@@ -251,6 +253,183 @@ function measurePolygon(H, imgPts) {
   return { valid: true, area: Math.abs(area2) / 2, perimeter: perim, worldPoints: world };
 }
 
+/* ----------------------------------------------------- regions with holes */
+function ringDiameter(pts) {
+  let d = 0;
+  for (let i = 0; i < pts.length; i++)
+    for (let j = i + 1; j < pts.length; j++) d = Math.max(d, dist(pts[i], pts[j]));
+  return d;
+}
+
+/** Closed-segment touch: proper crossings, endpoint tangency and collinear
+ *  overlap all count (rings in a region may not share any point). */
+function closedSegmentsTouch(p, q, a, b) {
+  const orient = (r, s, t) => (s.x - r.x) * (t.y - r.y) - (s.y - r.y) * (t.x - r.x);
+  const o1 = orient(p, q, a), o2 = orient(p, q, b);
+  const o3 = orient(a, b, p), o4 = orient(a, b, q);
+  const tol = GEO.CONTACT_TOL * Math.max(dist(p, q), dist(a, b), 1);
+  if ([o1, o2, o3, o4].every((o) => Math.abs(o) < tol)) {
+    const onSeg = (x, r, s) =>
+      x.x >= Math.min(r.x, s.x) - tol && x.x <= Math.max(r.x, s.x) + tol &&
+      x.y >= Math.min(r.y, s.y) - tol && x.y <= Math.max(r.y, s.y) + tol;
+    return [p, q, a, b].some((z) => onSeg(z, p, q) && onSeg(z, a, b));
+  }
+  const span = (u, v) =>
+    ((u > tol && v < -tol) || (u < -tol && v > tol) || (Math.abs(u) <= tol) || (Math.abs(v) <= tol));
+  return span(o1, o2) && span(o3, o4);
+}
+
+function ringsTouch(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    const p = a[i], q = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      if (closedSegmentsTouch(p, q, b[j], b[(j + 1) % b.length])) return [i, j];
+    }
+  }
+  return null;
+}
+
+function pointOnRingBoundary(pt, ring, tol) {
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const cross = (b.x - a.x) * (pt.y - a.y) - (b.y - a.y) * (pt.x - a.x);
+    if (Math.abs(cross) > tol * Math.max(dist(a, b), 1)) continue;
+    if (pt.x >= Math.min(a.x, b.x) - tol && pt.x <= Math.max(a.x, b.x) + tol &&
+        pt.y >= Math.min(a.y, b.y) - tol && pt.y <= Math.max(a.y, b.y) + tol) return true;
+  }
+  return false;
+}
+
+function pointInRingStrict(pt, ring, tol) {
+  if (pointOnRingBoundary(pt, ring, tol)) return "boundary";
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i], b = ring[j];
+    if ((a.y > pt.y) !== (b.y > pt.y) &&
+        pt.x < ((b.x - a.x) * (pt.y - a.y)) / (b.y - a.y) + a.x)
+      inside = !inside;
+  }
+  return inside ? "inside" : "outside";
+}
+
+function ringSignedArea2(pts) {
+  let a2 = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    a2 += a.x * b.y - b.x * a.y;
+  }
+  return a2;
+}
+
+function ringPerimeter(pts) {
+  let p = 0;
+  for (let i = 0; i < pts.length; i++) p += dist(pts[i], pts[(i + 1) % pts.length]);
+  return p;
+}
+
+/** Mirror of backend measure_region: all ring relations use world coords. */
+function measureRegion(H, outerImg, holesImg) {
+  holesImg = holesImg || [];
+  if (outerImg.length < 3) return { valid: false, errors: ["外环至少需要 3 个顶点"] };
+  const row3Scale = Math.max(Math.hypot(H[2][0], H[2][1]), Math.abs(H[2][2]));
+  const errors = [];
+
+  const toWorld = (pts, label) => {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const { x, y, w } = applyH(H, pts[i]);
+      if (Math.abs(w) < GEO.DENOM_TOL * row3Scale) {
+        errors.push(`${label} 顶点 ${i + 1} 的透视分母接近 0（位于无穷远线上），无法计算校正后坐标`);
+        return null;
+      }
+      out.push({ x, y });
+    }
+    return out;
+  };
+
+  const ringErrors = (pts, label) => {
+    const out = [];
+    if (pts.length < 3) { out.push(`${label} 至少需要 3 个顶点`); return out; }
+    const si = polygonSelfIntersects(pts);
+    if (si.hit) out.push(`${label} ${si.error}：自交或顶点重合的多边形没有唯一的面积，请调整顶点`);
+    if (Math.abs(ringSignedArea2(pts)) / 2 <
+        GEO.ZERO_AREA_TOL * Math.max(ringDiameter(pts) ** 2, 1))
+      out.push(`${label} 面积为 0（顶点近似共线或退化），请调整顶点`);
+    return out;
+  };
+
+  const worldOuter = toWorld(outerImg, "外环");
+  if (worldOuter === null) return { valid: false, errors };
+  errors.push(...ringErrors(worldOuter, "外环"));
+
+  const worldHoles = [];
+  for (let hi = 0; hi < holesImg.length; hi++) {
+    const wh = toWorld(holesImg[hi], `孔洞 ${hi + 1}`);
+    if (wh === null) continue;
+    worldHoles.push(wh);
+    errors.push(...ringErrors(wh, `孔洞 ${hi + 1}`));
+  }
+  if (errors.length) return { valid: false, errors };
+
+  const tol = GEO.CONTACT_TOL * Math.max(ringDiameter(worldOuter), 1);
+
+  // outer ring vs each hole
+  for (let hi = 0; hi < worldHoles.length; hi++) {
+    const wh = worldHoles[hi];
+    const tag = `孔洞 ${hi + 1}`;
+    const t = ringsTouch(worldOuter, wh);
+    if (t) {
+      errors.push(`${tag} 与外环相交或相切（孔洞边 ${t[1] + 1} 碰到外环边 ${t[0] + 1}），孔洞必须完全位于外环内部且互不接触`);
+      continue;
+    }
+    let bad = -1;
+    for (let vi = 0; vi < wh.length; vi++) {
+      if (pointInRingStrict(wh[vi], worldOuter, tol) !== "inside") { bad = vi; break; }
+    }
+    if (bad >= 0) errors.push(`${tag} 顶点 ${bad + 1} 位于外环之外，孔洞必须完全位于外环内部`);
+  }
+
+  // hole vs hole
+  let pairErrors = 0;
+  for (let i = 0; i < worldHoles.length && pairErrors < 6; i++) {
+    for (let j = i + 1; j < worldHoles.length && pairErrors < 6; j++) {
+      const t = ringsTouch(worldHoles[i], worldHoles[j]);
+      if (t) {
+        errors.push(`孔洞 ${i + 1} 与孔洞 ${j + 1} 相交或相切（孔洞 ${i + 1} 边 ${t[0] + 1} 与孔洞 ${j + 1} 边 ${t[1] + 1} 接触），孔洞之间必须完全分离`);
+        pairErrors++;
+        continue;
+      }
+      let bad = null;
+      for (let vi = 0; vi < worldHoles[j].length; vi++)
+        if (pointInRingStrict(worldHoles[j][vi], worldHoles[i], tol) !== "outside") { bad = [j, vi]; break; }
+      if (!bad)
+        for (let vi = 0; vi < worldHoles[i].length; vi++)
+          if (pointInRingStrict(worldHoles[i][vi], worldHoles[j], tol) !== "outside") { bad = [i, vi]; break; }
+      if (bad) {
+        const other = bad[0] === j ? i + 1 : j + 1;
+        errors.push(`孔洞 ${bad[0] + 1} 与孔洞 ${other} 未完全分离（孔洞 ${bad[0] + 1} 顶点 ${bad[1] + 1} 落在另一孔洞内或边界上），孔洞不允许相互包含`);
+        pairErrors++;
+      }
+    }
+  }
+  if (pairErrors >= 6) errors.push("……（还有更多孔洞冲突，未全部列出）");
+  if (errors.length) return { valid: false, errors };
+
+  const outerArea = Math.abs(ringSignedArea2(worldOuter)) / 2;
+  const holeAreas = worldHoles.map((wh) => Math.abs(ringSignedArea2(wh)) / 2);
+  const holePerimeters = worldHoles.map(ringPerimeter);
+  return {
+    valid: true,
+    area: outerArea - holeAreas.reduce((s, a) => s + a, 0),
+    perimeter: ringPerimeter(worldOuter) + holePerimeters.reduce((s, a) => s + a, 0),
+    outerArea,
+    holeAreas,
+    holePerimeters,
+    worldPoints: worldOuter,
+    worldHoles,
+  };
+}
+
 /* ============================================================ state ====== */
 const els = {};
 document.querySelectorAll("[id]").forEach((e) => (els[e.id] = e));
@@ -269,9 +448,10 @@ const state = {
   H: null,
   calibValid: false,
   calibErrors: [],
-  polygons: [],           // {id, name, points:[{x,y}], area, perimeter, valid, errors, worldPoints}
+  polygons: [],           // {id, name, points, holes:[{id,points,...}], area, outerArea, perimeter, valid, errors, worldPoints}
   selected: null,         // polygon id
-  draft: [],              // in-progress polygon points (image coords)
+  draft: [],              // in-progress ring points (image coords)
+  draftTarget: null,      // null = drawing a new outer ring; polyId = drawing a hole into it
   mode: "pan",            // calib | draw | edit | pan
   displayUnit: "mm",
   view: { scale: 1, x: 0, y: 0 }, // screen = image*scale + (x,y)
@@ -443,7 +623,7 @@ function render() {
     }
   }
 
-  // polygons
+  // polygons (outer ring + holes)
   state.polygons.forEach((poly, i) => {
     const color = polyColor(i);
     const selected = poly.id === state.selected;
@@ -452,15 +632,47 @@ function render() {
     ctx.moveTo(scr[0].x, scr[0].y);
     for (let k = 1; k < scr.length; k++) ctx.lineTo(scr[k].x, scr[k].y);
     ctx.closePath();
+    // holes join the same path; "evenodd" fill leaves them cut out
+    (poly.holes || []).forEach((hole) => {
+      const hs = hole.points.map(imgToScreen);
+      if (hs.length < 2) return;
+      ctx.moveTo(hs[0].x, hs[0].y);
+      for (let k = 1; k < hs.length; k++) ctx.lineTo(hs[k].x, hs[k].y);
+      ctx.closePath();
+    });
     ctx.fillStyle = poly.valid ? color + "26" : "rgba(255,107,107,.13)";
-    ctx.fill();
+    ctx.fill("evenodd");
     ctx.lineWidth = selected ? 2.6 : 1.8;
     ctx.strokeStyle = poly.valid ? color : "#ff6b6b";
     ctx.stroke();
 
+    // hole boundaries: dashed, red while the region is invalid
+    (poly.holes || []).forEach((hole) => {
+      const hs = hole.points.map(imgToScreen);
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(hs[0].x, hs[0].y);
+      for (let k = 1; k < hs.length; k++) ctx.lineTo(hs[k].x, hs[k].y);
+      ctx.closePath();
+      ctx.setLineDash([7, 5]);
+      ctx.lineWidth = selected ? 2.2 : 1.5;
+      ctx.strokeStyle = poly.valid ? color : "#ff6b6b";
+      ctx.stroke();
+      ctx.restore();
+    });
+
     if (state.mode === "edit" || selected) {
       poly.points.forEach((p, k) => {
-        drawHandle(imgToScreen(p), poly.valid ? color : "#ff6b6b", k === state.dragging?.vertex && state.dragging?.polyId === poly.id);
+        const active = k === state.dragging?.vertex && state.dragging?.polyId === poly.id &&
+                       state.dragging?.ring === "outer";
+        drawHandle(imgToScreen(p), poly.valid ? color : "#ff6b6b", active);
+      });
+      (poly.holes || []).forEach((hole, hi) => {
+        hole.points.forEach((p, k) => {
+          const active = state.dragging?.polyId === poly.id && state.dragging?.ring === "hole" &&
+                         state.dragging?.holeIndex === hi && k === state.dragging?.vertex;
+          drawHandle(imgToScreen(p), poly.valid ? color : "#ff6b6b", active, 5);
+        });
       });
     }
     // label
@@ -477,15 +689,17 @@ function render() {
     ctx.fillText(label, cx, cy + .5);
   });
 
-  // draft polygon
+  // draft ring (white = new outer ring, amber = new hole)
   if (state.draft.length > 0) {
+    const isHole = !!state.draftTarget;
+    const draftColor = isHole ? "#ffc24d" : "rgba(255,255,255,.85)";
     const scr = state.draft.map(imgToScreen);
     ctx.beginPath();
     ctx.moveTo(scr[0].x, scr[0].y);
     for (let k = 1; k < scr.length; k++) ctx.lineTo(scr[k].x, scr[k].y);
     if (state.hoverImg && pointInImage(state.hoverImg))
       ctx.lineTo(imgToScreen(state.hoverImg).x, imgToScreen(state.hoverImg).y);
-    ctx.strokeStyle = "rgba(255,255,255,.85)";
+    ctx.strokeStyle = draftColor;
     ctx.lineWidth = 1.6;
     ctx.save();
     ctx.setLineDash([5, 4]);
@@ -493,13 +707,14 @@ function render() {
     ctx.restore();
     // close hint line back to first point
     if (state.draft.length >= 2 && state.hoverImg && pointInImage(state.hoverImg))
-      drawDashedLine(imgToScreen(state.hoverImg), scr[0], "rgba(255,255,255,.45)");
+      drawDashedLine(imgToScreen(state.hoverImg), scr[0],
+                     isHole ? "rgba(255,194,77,.5)" : "rgba(255,255,255,.45)");
     state.draft.forEach((p, k) => {
       const sp = imgToScreen(p);
       // highlight first vertex when close enough to close
       if (k === 0 && state.hoverImg && dist(state.hoverImg, p) * state.view.scale < 12 && state.draft.length >= 3)
         drawHandle(sp, "#3ddc97", true, 8);
-      else drawHandle(sp, "#ffffff");
+      else drawHandle(sp, isHole ? "#ffc24d" : "#ffffff");
     });
   }
 }
@@ -564,26 +779,35 @@ function renderPolyList() {
     const areaConv = convertValue(poly.area, state.unit, state.displayUnit, true);
     const perConv = convertValue(poly.perimeter, state.unit, state.displayUnit, false);
     const areaUnit = state.displayUnit === "px" ? "px²" : `${state.displayUnit}²`;
+    const nHoles = (poly.holes || []).length;
+    const meta = poly.valid
+      ? `${poly.points.length} 外环顶点${nHoles ? ` · ${nHoles} 个孔洞（面积已扣除，周长含孔洞边界）` : ""}`
+      : "";
     card.innerHTML = `
       <div class="poly-card-head">
         <span class="poly-swatch" style="background:${color}"></span>
         <input type="text" value="${poly.name.replace(/"/g, "&quot;")}" data-id="${poly.id}" class="poly-name" />
+        <button class="btn btn-ghost btn-mini poly-hole-btn" data-id="${poly.id}" title="在该外环内部绘制一个镂空孔洞">◔ 挖洞</button>
         <button class="poly-del" data-id="${poly.id}" title="删除该区域">🗑</button>
       </div>
       <div class="poly-metrics">
-        <div class="metric"><span class="m-label">校正后面积</span>
+        <div class="metric"><span class="m-label">净面积（外环${nHoles ? "−孔洞" : ""}）</span>
           <span class="m-value ${poly.valid ? "" : "bad"}">${poly.valid ? fmtNum(areaConv) : "—"}</span>
           <span class="m-label m-unit">${areaUnit}</span></div>
-        <div class="metric"><span class="m-label">校正后周长</span>
+        <div class="metric"><span class="m-label">总周长（外环+孔洞）</span>
           <span class="m-value ${poly.valid ? "" : "bad"}">${poly.valid ? fmtNum(perConv) : "—"}</span>
           <span class="m-label m-unit">${state.displayUnit}</span></div>
       </div>
-      ${poly.valid ? `<div class="poly-meta">${poly.points.length} 个顶点 · 面积绝对值（多边形不要求朝向）</div>`
-                   : `<div class="poly-error">${(poly.errors || []).join("；")}</div>`}
+      ${meta ? `<div class="poly-meta">${meta}</div>`
+             : `<div class="poly-error">${(poly.errors || []).map((x) => `• ${x}`).join("<br>")}</div>`}
+      <div class="hole-list"></div>
     `;
     card.addEventListener("click", (e) => {
       if (e.target.closest(".poly-del")) {
         deletePolygon(poly.id);
+      } else if (e.target.closest(".poly-hole-btn")) {
+        state.selected = poly.id;
+        startHoleDraft(poly.id);
       } else if (e.target.closest(".poly-name")) {
         // allow editing; no selection change / mode switch
       } else {
@@ -595,7 +819,27 @@ function renderPolyList() {
       poly.name = e.target.value.trim() || poly.name;
       syncPolygon(poly);
     });
+    renderHoleRows(card.querySelector(".hole-list"), poly);
     list.appendChild(card);
+  });
+}
+
+/** Per-hole metrics + delete buttons inside a region card. */
+function renderHoleRows(container, poly) {
+  container.innerHTML = "";
+  (poly.holes || []).forEach((hole, hi) => {
+    const row = document.createElement("div");
+    row.className = "hole-row";
+    const ha = convertValue(hole.area, state.unit, state.displayUnit, true);
+    const hp = convertValue(hole.perimeter, state.unit, state.displayUnit, false);
+    const areaUnit = state.displayUnit === "px" ? "px²" : `${state.displayUnit}²`;
+    row.innerHTML = `
+      <span class="hole-tag">孔洞 ${hi + 1}</span>
+      <span class="hole-m">面积 <b>${hole.valid ? fmtNum(ha) : "—"}</b> ${areaUnit}</span>
+      <span class="hole-m">周长 <b>${hole.valid ? fmtNum(hp) : "—"}</b> ${state.displayUnit}</span>
+      <button class="hole-del" data-hi="${hi}" title="删除孔洞 ${hi + 1}">✕</button>`;
+    row.querySelector(".hole-del").addEventListener("click", () => removeHole(poly, hi));
+    container.appendChild(row);
   });
 }
 
@@ -620,6 +864,25 @@ function updatePolyCardMetrics() {
     const units = card.querySelectorAll(".m-unit");
     if (units[0]) units[0].textContent = state.displayUnit === "px" ? "px²" : `${state.displayUnit}²`;
     if (units[1]) units[1].textContent = state.displayUnit;
+    // live validity / conflict message + hole rows
+    const errBox = card.querySelector(".poly-error");
+    const metaBox = card.querySelector(".poly-meta");
+    const nHoles = (poly.holes || []).length;
+    if (poly.valid) {
+      if (errBox) {
+        const meta = document.createElement("div");
+        meta.className = "poly-meta";
+        meta.textContent = `${poly.points.length} 外环顶点${nHoles ? ` · ${nHoles} 个孔洞（面积已扣除，周长含孔洞边界）` : ""}`;
+        errBox.replaceWith(meta);
+      } else if (metaBox) {
+        metaBox.textContent = `${poly.points.length} 外环顶点${nHoles ? ` · ${nHoles} 个孔洞（面积已扣除，周长含孔洞边界）` : ""}`;
+      }
+      card.classList.remove("invalid");
+    } else if (errBox) {
+      errBox.innerHTML = (poly.errors || []).map((x) => `• ${x}`).join("<br>");
+      card.classList.add("invalid");
+    }
+    renderHoleRows(card.querySelector(".hole-list"), poly);
   });
 }
 
@@ -630,12 +893,17 @@ function renderModeButtons() {
   els.modePan.classList.toggle("active", state.mode === "pan");
   const panning = state.spaceDown || state.dragging?.type === "pan";
   $canvas.className = `mode-${state.mode}` + (panning ? " panning" : "");
-  const labels = { calib: "角点标定", draw: "绘制多边形", edit: "编辑顶点", pan: "平移视图" };
+  const labels = { calib: "角点标定", draw: "绘制多边形 / 孔洞", edit: "编辑顶点", pan: "平移视图" };
   els.modeLabel.textContent = `模式：${labels[state.mode]}`;
+  const targetName = state.draftTarget
+    ? state.polygons.find((p) => p.id === state.draftTarget)?.name
+    : null;
   const hints = {
     calib: "单击放置/拖动角点 · 右键拖动平移 · 滚轮缩放",
-    draw: "单击添加顶点 · 双击或 Enter 闭合 · Esc 取消 · Backspace 撤销",
-    edit: "拖动顶点或区域 · 右键顶点删除 · Del 删除区域",
+    draw: targetName
+      ? `正在为「${targetName}」挖洞：单击添加顶点 · 双击或 Enter 闭合 · Esc 取消 · Backspace 撤销`
+      : "单击添加顶点 · 双击或 Enter 闭合 · Esc 取消 · Backspace 撤销",
+    edit: "拖动外环/孔洞顶点或整体 · 右键顶点删除 · 右键孔洞删除孔洞 · Del 删除区域",
     pan: "拖动平移 · 滚轮缩放",
   };
   els.hintLabel.textContent = state.image ? hints[state.mode] : "";
@@ -710,37 +978,81 @@ async function recomputeCalibration({ push = true } = {}) {
   refreshUI();
 }
 
+function adoptServerPolygon(sp) {
+  const local = state.polygons.find((p) => p.id === sp.id);
+  if (!local) return;
+  local.name = sp.name;
+  local.points = sp.points.map((p) => ({ x: p.x, y: p.y }));
+  local.holes = (sp.holes || []).map((h) => ({
+    id: h.id,
+    points: h.points.map((p) => ({ x: p.x, y: p.y })),
+    area: h.area,
+    perimeter: h.perimeter,
+    valid: h.valid,
+    worldPoints: h.world_points,
+  }));
+  local.area = sp.area;
+  local.outerArea = sp.outer_area ?? null;
+  local.perimeter = sp.perimeter;
+  local.valid = sp.valid;
+  local.errors = sp.errors;
+  local.worldPoints = sp.world_points;
+}
+
 function mergeServerPolygons(serverPolys) {
-  for (const sp of serverPolys) {
-    const local = state.polygons.find((p) => p.id === sp.id);
-    if (!local) continue;
-    local.area = sp.area;
-    local.perimeter = sp.perimeter;
-    local.valid = sp.valid;
-    local.errors = sp.errors;
-    local.worldPoints = sp.world_points;
+  for (const sp of serverPolys) adoptServerPolygon(sp);
+}
+
+function measureLocal(poly) {
+  if (state.calibValid && state.H) {
+    return (poly.holes && poly.holes.length)
+      ? measureRegion(state.H, poly.points, poly.holes.map((h) => h.points))
+      : measurePolygon(state.H, poly.points);
+  }
+  return { valid: false, area: null, perimeter: null, errors: ["尚未完成透视校准"], worldPoints: null };
+}
+
+function applyLocalMeasure(poly, m) {
+  poly.valid = m.valid;
+  poly.area = m.area ?? null;
+  poly.outerArea = m.outerArea ?? null;
+  poly.perimeter = m.perimeter ?? null;
+  poly.errors = m.errors || [];
+  poly.worldPoints = m.worldPoints || null;
+  if (poly.holes) {
+    poly.holes.forEach((h, i) => {
+      if (m.valid && m.holeAreas) {
+        h.valid = true;
+        h.area = m.holeAreas[i];
+        h.perimeter = m.holePerimeters[i];
+        h.worldPoints = m.worldHoles[i];
+      } else {
+        h.valid = false;
+        h.area = null;
+        h.perimeter = null;
+        h.worldPoints = null;
+      }
+    });
   }
 }
 
 function recomputePolygonMetrics() {
-  for (const poly of state.polygons) {
-    if (state.calibValid && state.H) {
-      const m = measurePolygon(state.H, poly.points);
-      poly.valid = m.valid;
-      poly.area = m.area ?? null;
-      poly.perimeter = m.perimeter ?? null;
-      poly.errors = m.errors || [];
-      poly.worldPoints = m.worldPoints || null;
-    } else {
-      poly.valid = false;
-      poly.area = poly.perimeter = null;
-      poly.errors = ["尚未完成透视校准"];
-      poly.worldPoints = null;
-    }
-  }
+  for (const poly of state.polygons) applyLocalMeasure(poly, measureLocal(poly));
+}
+
+let holeIdCounter = 0;
+function newHoleId() {
+  holeIdCounter += 1;
+  return `hole-${Date.now().toString(36)}-${holeIdCounter}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /* ============================================================ polygons === */
+const polyBody = (poly) => ({
+  points: poly.points,
+  name: poly.name,
+  holes: (poly.holes || []).map((h) => ({ id: h.id, points: h.points })),
+});
+
 async function addPolygon(points, name) {
   const payload = { points, name };
   let created;
@@ -752,13 +1064,19 @@ async function addPolygon(points, name) {
     created = r.polygon;
   } catch (err) {
     toast("区域保存失败：" + err.message, true);
-    return;
+    return null;
   }
   state.polygons.push({
     id: created.id,
     name: created.name,
     points: created.points.map((p) => ({ x: p.x, y: p.y })),
+    holes: (created.holes || []).map((h) => ({
+      id: h.id,
+      points: h.points.map((p) => ({ x: p.x, y: p.y })),
+      area: h.area, perimeter: h.perimeter, valid: h.valid, worldPoints: h.world_points,
+    })),
     area: created.area,
+    outerArea: created.outer_area ?? null,
     perimeter: created.perimeter,
     valid: created.valid,
     errors: created.errors,
@@ -771,28 +1089,74 @@ async function addPolygon(points, name) {
   els.clearPolys.disabled = false;
   setMode("edit");
   refreshUI();
+  return state.polygons[state.polygons.length - 1];
 }
 
 let syncTimer = null;
 function syncPolygon(poly) {
   clearTimeout(syncTimer);
+  // Never push an invalid candidate: the server keeps its last valid result,
+  // and the live (red) preview is computed locally while dragging.
+  if (!poly.valid) {
+    showInvalidNotice(poly);
+    return;
+  }
+  showNotice(null);
   syncTimer = setTimeout(async () => {
+    let r;
     try {
-      const r = await api(`/api/sessions/${state.sessionId}/polygons/${poly.id}`, {
+      const res = await fetch(`/api/sessions/${state.sessionId}/polygons/${poly.id}`, {
         method: "PUT",
-        body: JSON.stringify({ points: poly.points, name: poly.name }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(polyBody(poly)),
       });
-      const sp = r.polygon;
-      poly.area = sp.area;
-      poly.perimeter = sp.perimeter;
-      poly.valid = sp.valid;
-      poly.errors = sp.errors;
-      poly.worldPoints = sp.world_points;
-      refreshUI();
+      if (res.status === 409) {
+        const data = await res.json();
+        // Only roll back if the local geometry is still the rejected candidate;
+        // otherwise a newer edit is in progress and must not be overwritten.
+        const cand = data.candidate;
+        const sameGeom = cand &&
+          cand.points.length === poly.points.length &&
+          cand.points.every((p, k) => p.x === poly.points[k].x && p.y === poly.points[k].y) &&
+          (cand.holes || []).length === (poly.holes || []).length &&
+          (cand.holes || []).every((h, hi) =>
+            h.points.length === poly.holes[hi].points.length &&
+            h.points.every((p, k) => p.x === poly.holes[hi].points[k].x && p.y === poly.holes[hi].points[k].y));
+        if (sameGeom && data.polygon) adoptServerPolygon(data.polygon);
+        showNotice((cand?.errors || ["区域几何校验未通过"]).join("；") +
+                   " —— 服务端保留最后一次有效结果", true);
+        refreshUI();
+        return;
+      }
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+        throw new Error(detail);
+      }
+      r = await res.json();
     } catch (err) {
       toast("区域更新失败：" + err.message, true);
+      return;
     }
+    const sp = r.polygon;
+    poly.area = sp.area;
+    poly.outerArea = sp.outer_area ?? null;
+    poly.perimeter = sp.perimeter;
+    poly.valid = sp.valid;
+    poly.errors = sp.errors;
+    poly.worldPoints = sp.world_points;
+    poly.holes = (sp.holes || []).map((h) => ({
+      id: h.id,
+      points: h.points.map((p) => ({ x: p.x, y: p.y })),
+      area: h.area, perimeter: h.perimeter, valid: h.valid, worldPoints: h.world_points,
+    }));
+    showNotice(null);
+    refreshUI();
   }, 250);
+}
+
+function showInvalidNotice(poly) {
+  showNotice(`「${poly.name}」当前状态非法：${(poly.errors || []).join("；")} —— 拖动调整后会实时重算，服务端结果未被覆盖`, true);
 }
 
 async function deletePolygon(id) {
@@ -829,7 +1193,13 @@ function hitPolygonVertex(imgPt) {
   for (let i = state.polygons.length - 1; i >= 0; i--) {
     const poly = state.polygons[i];
     for (let k = 0; k < poly.points.length; k++)
-      if (dist(poly.points[k], imgPt) < TOL) return { polyIndex: i, polyId: poly.id, vertex: k };
+      if (dist(poly.points[k], imgPt) < TOL) return { polyIndex: i, polyId: poly.id, ring: "outer", vertex: k };
+    for (let hi = (poly.holes || []).length - 1; hi >= 0; hi--) {
+      const hole = poly.holes[hi];
+      for (let k = 0; k < hole.points.length; k++)
+        if (dist(hole.points[k], imgPt) < TOL)
+          return { polyIndex: i, polyId: poly.id, ring: "hole", holeIndex: hi, holeId: hole.id, vertex: k };
+    }
   }
   return null;
 }
@@ -845,17 +1215,33 @@ function pointInPolygon(pt, pts) {
   return inside;
 }
 
+/** {polyIndex, ring:'outer'|'hole', holeIndex} or null.  The physical solid
+ *  region is outer minus holes, so points inside a hole do not grab the body. */
 function hitPolygonBody(imgPt) {
   for (let i = state.polygons.length - 1; i >= 0; i--) {
     const poly = state.polygons[i];
-    if (pointInPolygon(imgPt, poly.points)) return i;
-    // near an edge
-    const TOL = 6 / state.view.scale;
-    for (let k = 0; k < poly.points.length; k++) {
-      if (distToSegment(imgPt, poly.points[k], poly.points[(k + 1) % poly.points.length]) < TOL) return i;
+    const edgeHit = (pts, ring, holeIndex) => {
+      const TOL = 6 / state.view.scale;
+      for (let k = 0; k < pts.length; k++)
+        if (distToSegment(imgPt, pts[k], pts[(k + 1) % pts.length]) < TOL)
+          return { polyIndex: i, polyId: poly.id, ring, holeIndex };
+      return null;
+    };
+    // holes first: hole edges/interiors take precedence over the outer body
+    for (let hi = (poly.holes || []).length - 1; hi >= 0; hi--) {
+      const hp = poly.holes[hi].points;
+      const h = edgeHit(hp, "hole", hi);
+      if (h) return h;
+      if (pointInPolygon(imgPt, hp)) return { polyIndex: i, polyId: poly.id, ring: "hole", holeIndex: hi };
+    }
+    const o = edgeHit(poly.points, "outer", null);
+    if (o) return o;
+    if (pointInPolygon(imgPt, poly.points)) {
+      const insideHole = (poly.holes || []).some((hh) => pointInPolygon(imgPt, hh.points));
+      if (!insideHole) return { polyIndex: i, polyId: poly.id, ring: "outer", holeIndex: null };
     }
   }
-  return -1;
+  return null;
 }
 
 function distToSegment(p, a, b) {
@@ -899,7 +1285,7 @@ $canvas.addEventListener("pointerdown", (e) => {
 
   if (state.mode === "draw") {
     if (!state.calibValid) return;
-    // A double-click closes the polygon; its second pointerdown must not add
+    // A double-click closes the ring; its second pointerdown must not add
     // a duplicate vertex at the same spot.
     if (state.draft.length && dist(ip, state.draft[state.draft.length - 1]) < 8 / state.view.scale)
       return;
@@ -917,16 +1303,23 @@ $canvas.addEventListener("pointerdown", (e) => {
     const hv = hitPolygonVertex(ip);
     if (hv) {
       state.selected = hv.polyId;
-      state.dragging = { type: "vertex", ...hv };
+      state.dragging = {
+        type: "vertex",
+        ...hv,
+      };
     } else {
-      const bi = hitPolygonBody(ip);
-      if (bi >= 0) {
-        state.selected = state.polygons[bi].id;
+      const hit = hitPolygonBody(ip);
+      if (hit) {
+        const poly = state.polygons[hit.polyIndex];
+        state.selected = poly.id;
+        const ringPts = hit.ring === "hole" ? poly.holes[hit.holeIndex].points : poly.points;
         state.dragging = {
           type: "body",
-          polyId: state.selected,
+          polyId: poly.id,
+          ring: hit.ring,
+          holeIndex: hit.holeIndex,
           startImg: ip,
-          orig: state.polygons[bi].points.map((p) => ({ ...p })),
+          orig: ringPts.map((p) => ({ ...p })),
         };
       } else {
         state.selected = null;
@@ -960,13 +1353,17 @@ $canvas.addEventListener("pointermove", (e) => {
   }
   const poly = state.polygons.find((p) => p.id === d.polyId);
   if (!poly) return;
+  const ringPts = d.ring === "hole" ? poly.holes[d.holeIndex].points : poly.points;
   if (d.type === "vertex") {
-    poly.points[d.vertex] = clampImagePoint(ip);
+    ringPts[d.vertex] = clampImagePoint(ip);
   } else if (d.type === "body") {
     const dx = ip.x - d.startImg.x, dy = ip.y - d.startImg.y;
-    poly.points = d.orig.map((p) => clampImagePoint({ x: p.x + dx, y: p.y + dy }));
+    const moved = d.orig.map((p) => clampImagePoint({ x: p.x + dx, y: p.y + dy }));
+    if (d.ring === "hole") poly.holes[d.holeIndex].points = moved;
+    else poly.points = moved;
   }
-  recomputePolygonMetrics();
+  applyLocalMeasure(poly, measureLocal(poly));
+  if (!poly.valid) showInvalidNotice(poly); else showNotice(null);
   render();
   updatePolyCardMetrics();
 });
@@ -1003,15 +1400,29 @@ $canvas.addEventListener("contextmenu", (e) => {
     const hv = hitPolygonVertex(ip);
     if (hv) {
       const poly = state.polygons[hv.polyIndex];
-      if (poly.points.length <= 3) {
-        toast("闭合多边形至少保留 3 个顶点，已改为删除整个区域");
-        void deletePolygon(poly.id);
+      const ring = hv.ring === "hole" ? poly.holes[hv.holeIndex] : poly;
+      const ringName = hv.ring === "hole" ? `孔洞 ${hv.holeIndex + 1}` : "外环";
+      if (ring.points.length <= 3) {
+        if (hv.ring === "hole") {
+          if (!confirm(`${ringName} 至少保留 3 个顶点，改为删除整个孔洞？`)) return;
+          removeHole(poly, hv.holeIndex);
+        } else {
+          toast("闭合多边形至少保留 3 个顶点，已改为删除整个区域");
+          void deletePolygon(poly.id);
+        }
       } else {
-        poly.points.splice(hv.vertex, 1);
-        recomputePolygonMetrics();
+        ring.points.splice(hv.vertex, 1);
+        applyLocalMeasure(poly, measureLocal(poly));
         syncPolygon(poly);
         refreshUI();
       }
+      return;
+    }
+    // right-click inside a hole body deletes that hole
+    const hit = hitPolygonBody(ip);
+    if (hit && hit.ring === "hole") {
+      const poly = state.polygons[hit.polyIndex];
+      if (confirm(`删除该区域的孔洞 ${hit.holeIndex + 1}？`)) removeHole(poly, hit.holeIndex);
     }
   }
 });
@@ -1025,16 +1436,45 @@ $canvas.addEventListener("wheel", (e) => {
 
 function finishDraft() {
   const pts = state.draft.map((p) => ({ ...p }));
+  const targetId = state.draftTarget;
   state.draft = [];
-  if (pts.length < 3) { toast("至少需要 3 个顶点"); return; }
+  state.draftTarget = null;
+  if (pts.length < 3) { toast("至少需要 3 个顶点"); state.draft = pts; state.draftTarget = targetId; return; }
+
+  if (targetId) {
+    const poly = state.polygons.find((p) => p.id === targetId);
+    if (!poly) { setMode("edit"); refreshUI(); return; }
+    const hole = { id: newHoleId(), points: pts, valid: false, area: null, perimeter: null, worldPoints: null };
+    poly.holes = poly.holes || [];
+    poly.holes.push(hole);
+    state.selected = poly.id;
+    applyLocalMeasure(poly, measureLocal(poly));
+    if (poly.valid) {
+      syncPolygon(poly);
+    } else {
+      // Keep the hole locally for adjustment; nothing invalid reaches the server.
+      showInvalidNotice(poly);
+    }
+    setMode("edit");
+    refreshUI();
+    return;
+  }
+
   // Instant local validity feedback, server re-checks on persist.
   const m = state.calibValid ? measurePolygon(state.H, pts) : { valid: false, errors: ["尚未标定"] };
   if (!m.valid) {
     showNotice(m.errors.join("；"), true);
-    state.draft = pts; // keep editing
+    state.draft = pts;
     return;
   }
   void addPolygon(pts);
+}
+
+function removeHole(poly, holeIndex) {
+  poly.holes.splice(holeIndex, 1);
+  applyLocalMeasure(poly, measureLocal(poly));
+  syncPolygon(poly);
+  refreshUI();
 }
 
 /* ============================================================ keyboard == */
@@ -1043,6 +1483,7 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "Space") { state.spaceDown = true; renderModeButtons(); e.preventDefault(); }
   if (e.key === "Escape") {
     state.draft = [];
+    state.draftTarget = null;
     state.dragging = null;
     showNotice(null);
     render();
@@ -1079,17 +1520,32 @@ function setMode(m) {
     return;
   }
   if (m === "edit" && state.polygons.length === 0) return;
+  if (m !== "draw") {
+    state.draft = [];
+    state.draftTarget = null;
+  }
   state.mode = m;
-  if (m !== "draw") state.draft = [];
   showNotice(null);
   renderModeButtons();
   render();
 }
+
+/** Enter hole-drawing mode for a specific existing region. */
+function startHoleDraft(polyId) {
+  const poly = state.polygons.find((p) => p.id === polyId);
+  if (!poly) return;
+  state.selected = polyId;
+  state.draftTarget = polyId;
+  state.draft = [];
+  setMode("draw");
+  showNotice(`正在为「${poly.name}」绘制镂空孔洞：单击加点，双击/Enter 闭合；孔洞必须完全位于外环内且与其他孔洞分离`, false);
+}
+
 els.modeCalib.addEventListener("click", () => setMode("calib"));
-els.modeDraw.addEventListener("click", () => setMode("draw"));
+els.modeDraw.addEventListener("click", () => { state.draftTarget = null; setMode("draw"); });
 els.modeEdit.addEventListener("click", () => setMode("edit"));
 els.modePan.addEventListener("click", () => setMode("pan"));
-els.modeDrawAnother.addEventListener("click", () => setMode("draw"));
+els.modeDrawAnother.addEventListener("click", () => { state.draftTarget = null; setMode("draw"); });
 
 els.clearCorners.addEventListener("click", () => {
   state.corners = [];
@@ -1196,7 +1652,12 @@ function hydrateSession(s) {
     state.polygons = s.polygons.map((p) => ({
       id: p.id, name: p.name,
       points: p.points.map((q) => ({ x: q.x, y: q.y })),
-      area: p.area, perimeter: p.perimeter, valid: p.valid,
+      holes: (p.holes || []).map((h) => ({
+        id: h.id,
+        points: h.points.map((q) => ({ x: q.x, y: q.y })),
+        area: h.area, perimeter: h.perimeter, valid: h.valid, worldPoints: h.world_points,
+      })),
+      area: p.area, outerArea: p.outer_area ?? null, perimeter: p.perimeter, valid: p.valid,
       errors: p.errors, worldPoints: p.world_points,
     }));
     state.selected = state.polygons[0]?.id || null;
@@ -1223,6 +1684,7 @@ function resetUI() {
   state.calibErrors = [];
   state.polygons = [];
   state.draft = [];
+  state.draftTarget = null;
   state.selected = null;
   els.exportBtn.disabled = true;
   els.emptyOverlay.classList.remove("hidden");
@@ -1261,6 +1723,7 @@ async function uploadFile(file) {
   state.calibValid = false;
   state.polygons = [];
   state.draft = [];
+  state.draftTarget = null;
   state.selected = null;
   els.rectW.value = ""; els.rectH.value = "";
   state.rectW = null; state.rectH = null;

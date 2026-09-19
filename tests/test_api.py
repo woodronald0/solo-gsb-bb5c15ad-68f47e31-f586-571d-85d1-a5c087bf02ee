@@ -116,20 +116,110 @@ r = client.post(f"/api/sessions/{sid}/polygons",
                 json={"points": [{"x": -5, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}]})
 check("out-of-range rejected", r.status_code == 400)
 
+print("== regions with holes ==")
+# outer world rect [0.01,0.09] x [0.01,0.05]: area .08*.04=.0032, perim .24
+outer_img = [project(0.01, 0.01), project(0.09, 0.01), project(0.09, 0.05), project(0.01, 0.05)]
+# hole [0.02,0.03] x [0.02,0.03]: area .01*.01=.0001, perim .04
+hole_img = [project(0.02, 0.02), project(0.03, 0.02), project(0.03, 0.03), project(0.02, 0.03)]
+r = client.post(f"/api/sessions/{sid}/polygons",
+                json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                      "holes": [{"points": [{"x": float(u), "y": float(v)} for u, v in hole_img]}]})
+check("region add", r.status_code == 200, str(r.status_code))
+h1 = r.json()["polygon"]
+check("region valid", h1["valid"], h1["errors"])
+check("net area .0031", h1["valid"] and abs(h1["area"] - 0.0031) < 1e-9, f"area={h1['area']}")
+check("total perim .28", h1["valid"] and abs(h1["perimeter"] - 0.28) < 1e-9, f"p={h1['perimeter']}")
+check("outer area .0032", h1["valid"] and abs(h1["outer_area"] - 0.0032) < 1e-9)
+check("hole payload", len(h1["holes"]) == 1 and h1["holes"][0]["valid"]
+      and abs(h1["holes"][0]["area"] - 0.0001) < 1e-9, str(h1.get("holes")))
+check("hole has id", bool(h1["holes"][0]["id"]))
+
+# invalid candidate on PUT must be rejected with 409 and NOT overwrite stored data
+hole_touch = [project(0.01, 0.01), project(0.02, 0.01), project(0.02, 0.02), project(0.01, 0.02)]
+r = client.put(f"/api/sessions/{sid}/polygons/{h1['id']}",
+               json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                     "holes": [{"points": [{"x": float(u), "y": float(v)} for u, v in hole_touch]}]})
+check("invalid update -> 409", r.status_code == 409, str(r.status_code))
+if r.status_code == 409:
+    body = r.json()
+    check("409 keeps stored", body.get("conflict") and body["polygon"]["valid"]
+          and abs(body["polygon"]["area"] - 0.0031) < 1e-9)
+    check("409 reports candidate", "相切" in body["candidate"]["errors"][0]
+          or "相交" in body["candidate"]["errors"][0], body["candidate"]["errors"])
+# server really kept the last valid result
+r = client.get(f"/api/sessions/{sid}")
+stored = [p for p in r.json()["polygons"] if p["id"] == h1["id"]][0]
+check("stored result intact", stored["valid"] and abs(stored["area"] - 0.0031) < 1e-9)
+
+# hole fully outside the outer ring -> invalid (persisted on POST, marked invalid)
+hole_out = [project(0.05, 0.0), project(0.06, 0.0), project(0.06, 0.005), project(0.05, 0.005)]
+r = client.post(f"/api/sessions/{sid}/polygons",
+                json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                      "holes": [{"points": [{"x": float(u), "y": float(v)} for u, v in hole_out]}]})
+bad_region = r.json()["polygon"]
+check("outside hole invalid", not bad_region["valid"]
+      and "之外" in bad_region["errors"][0], bad_region["errors"])
+# invalid geometry IS persisted on creation; GET reflects it (no prior valid
+# result to protect), and session reload keeps it
+r = client.get(f"/api/sessions/{sid}")
+stored_bad = [p for p in r.json()["polygons"] if p["id"] == bad_region["id"]]
+check("invalid region persisted", bool(stored_bad) and not stored_bad[0]["valid"])
+
+# two holes tangent to each other -> invalid
+ha = [project(0.02, 0.02), project(0.03, 0.02), project(0.03, 0.03), project(0.02, 0.03)]
+hb = [project(0.03, 0.025), project(0.04, 0.025), project(0.04, 0.035), project(0.03, 0.035)]
+r = client.post(f"/api/sessions/{sid}/polygons",
+                json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                      "holes": [
+                          {"points": [{"x": float(u), "y": float(v)} for u, v in ha]},
+                          {"points": [{"x": float(u), "y": float(v)} for u, v in hb]}]})
+tg = r.json()["polygon"]
+check("tangent holes invalid", not tg["valid"] and "孔洞" in tg["errors"][0], tg["errors"])
+
+# repair: two fully separated holes -> area .0032 - .0001 - .0001 = .003
+hc = [project(0.07, 0.03), project(0.08, 0.03), project(0.08, 0.04), project(0.07, 0.04)]
+r = client.put(f"/api/sessions/{sid}/polygons/{tg['id']}",
+               json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                     "holes": [
+                         {"points": [{"x": float(u), "y": float(v)} for u, v in ha]},
+                         {"points": [{"x": float(u), "y": float(v)} for u, v in hc]}]})
+fix = r.json()["polygon"]
+check("repair valid", fix["valid"], fix.get("errors"))
+check("two-hole net area", fix["valid"] and abs(fix["area"] - 0.003) < 1e-9, f"area={fix['area']}")
+check("two-hole perim", fix["valid"] and abs(fix["perimeter"] - 0.32) < 1e-9, f"p={fix['perimeter']}")
+
+# remove holes (holes: []) -> plain region again
+r = client.put(f"/api/sessions/{sid}/polygons/{h1['id']}",
+               json={"points": [{"x": float(u), "y": float(v)} for u, v in outer_img],
+                     "holes": []})
+plain = r.json()["polygon"]
+check("holes removed", plain["valid"] and abs(plain["area"] - 0.0032) < 1e-9
+      and plain["holes"] == [])
+
 print("== export ==")
 r = client.get(f"/api/sessions/{sid}/export")
 check("export 200", r.status_code == 200)
 data = r.json()
-check("schema tag", data["schema"] == "photo-ruler/1.0")
+check("schema tag", data["schema"] in ("photo-ruler/1.0", "photo-ruler/1.1"))
 check("calibration in export", data["calibration"] and data["calibration"]["valid"])
-check("polygon count", len(data["polygons"]) == 1)
-check("all valid flag", data["all_measurements_valid"] is True)
+# polygons present: original p1 (area .002), h1 (now holes removed),
+# bad_region (invalid, outside hole), fix (two holes)
+check("polygon count", len(data["polygons"]) == 4, str(len(data["polygons"])))
+check("all valid flag", data["all_measurements_valid"] is False)
 check("export area", abs(data["polygons"][0]["area"] - 0.002) < 1e-9)
 check("homography present", len(data["calibration"]["homography_image_to_world"]) == 3)
+exp_fix = [p for p in data["polygons"] if p["id"] == fix["id"]][0]
+check("export holes", len(exp_fix["holes"]) == 2
+      and all(h["world_points"] and abs(h["area"] - 0.0001) < 1e-9 for h in exp_fix["holes"]))
+check("export hole img pts", len(exp_fix["holes"][0]["image_points"]) == 4)
+check("export net area", abs(exp_fix["area"] - 0.003) < 1e-9)
+check("export outer area", abs(exp_fix["outer_area"] - 0.0032) < 1e-9)
 
 print("== persistence ==")
 r = client.get(f"/api/sessions/{sid}")
-check("session reload has data", r.json()["image"] is not None and len(r.json()["polygons"]) == 1)
+check("session reload has data", r.json()["image"] is not None and len(r.json()["polygons"]) == 4)
+reloaded_fix = [p for p in r.json()["polygons"] if p["id"] == fix["id"]][0]
+check("holes survive reload", reloaded_fix["valid"] and len(reloaded_fix["holes"]) == 2)
 
 r = client.get("/api/health")
 check("health", r.json()["status"] == "ok")

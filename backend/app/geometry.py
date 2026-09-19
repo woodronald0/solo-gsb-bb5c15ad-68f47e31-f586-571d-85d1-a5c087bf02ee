@@ -31,6 +31,8 @@ MIN_PIVOT = 1e-9        # least-squares pivot threshold (singular DLT)
 RESIDUAL_TOL = 1e-7     # max normalized DLT residual
 H_DET_TOL = 1e-8        # |det H| relative to |H|^3
 DENOM_TOL = 1e-9        # |w| / |H row 3| for mapping through infinity
+CONTACT_TOL = 1e-8      # |cross| / edge-length: rings intersecting or tangent
+ZERO_AREA_TOL = 1e-10   # |ring area| relative to ring diameter squared
 
 _EPS = 1e-12
 
@@ -301,3 +303,255 @@ def measure_polygon(H: list[list[float]], image_points: list[list[float]]) -> Me
         area2 += x1 * y2 - x2 * y1
         perimeter += float(np.hypot(x2 - x1, y2 - y1))
     return MeasurementResult(True, abs(area2) / 2.0, perimeter, world)
+
+
+# ---------------------------------------------------------------------------
+# Regions with holes
+#
+# A region is one closed outer ring plus zero or more closed hole rings.
+# Ring relations are always checked in *corrected world coordinates* (the
+# projective map can change apparent containment in the photo):
+#   - every hole must lie strictly inside the outer ring;
+#   - holes must not intersect or touch the outer ring;
+#   - holes must not intersect or touch one another (tangency included).
+# Area = outer area - sum(hole areas); perimeter counts every boundary.
+# ---------------------------------------------------------------------------
+
+def _ring_diameter(pts: list[np.ndarray]) -> float:
+    diag = 0.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            diag = max(diag, float(np.hypot(*(pts[i] - pts[j]))))
+    return diag
+
+
+def _closed_segments_touch(p: np.ndarray, q: np.ndarray,
+                           a: np.ndarray, b: np.ndarray) -> bool:
+    """True when closed segments p-q and a-b have any common point.
+
+    Includes proper crossings, endpoint-on-segment tangency and collinear
+    overlap (the open-segment test used for self-intersection intentionally
+    ignores shared endpoints — rings in a region may not share any).
+    """
+    def orient(r, s, t):
+        return (s[0] - r[0]) * (t[1] - r[1]) - (s[1] - r[1]) * (t[0] - r[0])
+
+    o1 = orient(p, q, a)
+    o2 = orient(p, q, b)
+    o3 = orient(a, b, p)
+    o4 = orient(a, b, q)
+    tol = CONTACT_TOL * max(float(np.hypot(*(q - p))), float(np.hypot(*(b - a))), 1.0)
+    if all(abs(o) < tol for o in (o1, o2, o3, o4)):
+        def on_seg(x, r, s):
+            return (
+                min(r[0], s[0]) - tol <= x[0] <= max(r[0], s[0]) + tol
+                and min(r[1], s[1]) - tol <= x[1] <= max(r[1], s[1]) + tol
+            )
+        return any(on_seg(z, p, q) and on_seg(z, a, b)
+                   for z in (p, q, a, b))
+    return (
+        ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol)
+         or (-tol <= o1 <= tol) or (-tol <= o2 <= tol))
+        and
+        ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol)
+         or (-tol <= o3 <= tol) or (-tol <= o4 <= tol))
+    )
+
+
+def _rings_touch(ring_a: list[np.ndarray], ring_b: list[np.ndarray]) -> tuple[int, int] | None:
+    """Return (edge index in A, edge index in B) of the first touching edges."""
+    for i, p in enumerate(ring_a):
+        q = ring_a[(i + 1) % len(ring_a)]
+        for j, a in enumerate(ring_b):
+            b = ring_b[(j + 1) % len(ring_b)]
+            if _closed_segments_touch(p, q, a, b):
+                return i, j
+    return None
+
+
+def _point_on_ring_boundary(pt: np.ndarray, ring: list[np.ndarray], tol: float) -> bool:
+    for i, a in enumerate(ring):
+        b = ring[(i + 1) % len(ring)]
+        cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0])
+        if abs(cross) > tol * max(float(np.hypot(*(b - a))), 1.0):
+            continue
+        if (min(a[0], b[0]) - tol <= pt[0] <= max(a[0], b[0]) + tol
+                and min(a[1], b[1]) - tol <= pt[1] <= max(a[1], b[1]) + tol):
+            return True
+    return False
+
+
+def _point_in_ring_strict(pt: np.ndarray, ring: list[np.ndarray],
+                          tol: float) -> str:
+    """'inside' / 'outside' / 'boundary' for a point against one closed ring."""
+    if _point_on_ring_boundary(pt, ring, tol):
+        return "boundary"
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        a, b = ring[i], ring[j]
+        if (a[1] > pt[1]) != (b[1] > pt[1]):
+            xcross = a[0] + (b[0] - a[0]) * (pt[1] - a[1]) / (b[1] - a[1])
+            if pt[0] < xcross - tol:
+                inside = not inside
+        j = i
+    return "inside" if inside else "outside"
+
+
+def _ring_signed_area2(pts: list[np.ndarray]) -> float:
+    area2 = 0.0
+    for i, a in enumerate(pts):
+        b = pts[(i + 1) % len(pts)]
+        area2 += a[0] * b[1] - b[0] * a[1]
+    return area2
+
+
+def _ring_perimeter(pts: list[np.ndarray]) -> float:
+    return sum(
+        float(np.hypot(*(pts[(i + 1) % len(pts)] - pts[i])))
+        for i in range(len(pts))
+    )
+
+
+@dataclass
+class RegionResult:
+    ok: bool
+    area: float | None = None
+    perimeter: float | None = None
+    outer_area: float | None = None
+    hole_areas: list[float] | None = None
+    hole_perimeters: list[float] | None = None
+    world_points: list[list[float]] | None = None
+    world_holes: list[list[list[float]]] | None = None
+    errors: list[str] | None = None
+
+
+def measure_region(
+    H: list[list[float]],
+    outer_image: list[list[float]],
+    holes_image: list[list[list[float]]] | None = None,
+) -> RegionResult:
+    """Measure a region with holes; all ring checks use corrected world coords."""
+    holes_image = holes_image or []
+    if len(outer_image) < 3:
+        return RegionResult(False, errors=["外环至少需要 3 个顶点"])
+
+    row3 = np.asarray(H, dtype=float)[2]
+    row3_scale = float(np.hypot(row3[0], row3[1]))
+    if row3_scale < _EPS:
+        row3_scale = abs(float(row3[2]))
+
+    def to_world(points: list[list[float]], label: str) -> list[np.ndarray] | None:
+        out: list[np.ndarray] = []
+        for i, p in enumerate(points):
+            x, y, w = apply_homography(H, p)
+            if abs(w) < DENOM_TOL * max(row3_scale, 1.0):
+                errs.append(f"{label}顶点 {i + 1} 的透视分母接近 0（位于无穷远线上），无法计算校正后坐标")
+                return None
+            out.append(np.array([x / w, y / w], dtype=float))
+        return out
+
+    errs: list[str] = []
+
+    # --- per-ring structural validity (duplicates, self-crossing, zero area)
+    def ring_errors(points: list[list[float]], world: list[np.ndarray],
+                    label: str) -> list[str]:
+        out: list[str] = []
+        if len(points) < 3:
+            out.append(f"{label} 至少需要 3 个顶点")
+            return out
+        crosses, reason = polygon_self_intersects([[float(p[0]), float(p[1])] for p in world])
+        if crosses:
+            out.append(f"{label} {reason}：自交或顶点重合的多边形没有唯一的面积，请调整顶点")
+        if abs(_ring_signed_area2(world)) / 2.0 < ZERO_AREA_TOL * max(_ring_diameter(world) ** 2, 1.0):
+            out.append(f"{label} 面积为 0（顶点近似共线或退化），请调整顶点")
+        return out
+
+    world_outer = to_world(outer_image, "外环")
+    if world_outer is None:
+        return RegionResult(False, errors=errs)
+    errs += ring_errors(outer_image, world_outer, "外环")
+
+    world_holes: list[list[np.ndarray]] = []
+    for hi, hpts in enumerate(holes_image):
+        wh = to_world(hpts, f"孔洞 {hi + 1}")
+        # to_world appends a single error and returns None on failure
+        if wh is None:
+            continue
+        world_holes.append(wh)
+        errs += ring_errors(hpts, wh, f"孔洞 {hi + 1}")
+    if errs:
+        return RegionResult(False, errors=errs)
+
+    tol = CONTACT_TOL * max(_ring_diameter(world_outer), 1.0)
+
+    # --- outer ring vs each hole: no touch, strict containment
+    for hi, wh in enumerate(world_holes):
+        tag = f"孔洞 {hi + 1}"
+        touch = _rings_touch(world_outer, wh)
+        if touch is not None:
+            errs.append(
+                f"{tag} 与外环相交或相切（孔洞边 {touch[1] + 1} 碰到外环边 {touch[0] + 1}），"
+                f"孔洞必须完全位于外环内部且互不接触"
+            )
+            continue
+        bad_vertex = None
+        for vi, v in enumerate(wh):
+            if _point_in_ring_strict(v, world_outer, tol) != "inside":
+                bad_vertex = vi
+                break
+        if bad_vertex is not None:
+            errs.append(f"{tag} 顶点 {bad_vertex + 1} 位于外环之外，孔洞必须完全位于外环内部")
+
+    # --- hole vs hole: disjoint (may not touch; nesting is not allowed either)
+    pair_errors = 0
+    for i in range(len(world_holes)):
+        for j in range(i + 1, len(world_holes)):
+            touch = _rings_touch(world_holes[i], world_holes[j])
+            if touch is not None:
+                errs.append(
+                    f"孔洞 {i + 1} 与孔洞 {j + 1} 相交或相切"
+                    f"（孔洞 {i + 1} 边 {touch[0] + 1} 与孔洞 {j + 1} 边 {touch[1] + 1} 接触），孔洞之间必须完全分离"
+                )
+                pair_errors += 1
+            else:
+                bad = None
+                for vi, v in enumerate(world_holes[j]):
+                    if _point_in_ring_strict(v, world_holes[i], tol) != "outside":
+                        bad = (j, vi)
+                        break
+                if bad is None:
+                    for vi, v in enumerate(world_holes[i]):
+                        if _point_in_ring_strict(v, world_holes[j], tol) != "outside":
+                            bad = (i, vi)
+                            break
+                if bad is not None:
+                    errs.append(
+                        f"孔洞 {bad[0] + 1} 与孔洞 {i + 1 if bad[0] == j else j + 1} "
+                        f"未完全分离（孔洞 {bad[0] + 1} 顶点 {bad[1] + 1} 落在另一孔洞内或边界上），孔洞不允许相互包含"
+                    )
+                    pair_errors += 1
+            if pair_errors >= 6:
+                errs.append("……（还有更多孔洞冲突，未全部列出）")
+                break
+        if pair_errors >= 6:
+            break
+    if errs:
+        return RegionResult(False, errors=errs)
+
+    outer_area = abs(_ring_signed_area2(world_outer)) / 2.0
+    hole_areas = [abs(_ring_signed_area2(wh)) / 2.0 for wh in world_holes]
+    perimeter = _ring_perimeter(world_outer) + sum(
+        _ring_perimeter(wh) for wh in world_holes
+    )
+    return RegionResult(
+        True,
+        area=outer_area - sum(hole_areas),
+        perimeter=perimeter,
+        outer_area=outer_area,
+        hole_areas=hole_areas,
+        hole_perimeters=[_ring_perimeter(wh) for wh in world_holes],
+        world_points=[[float(p[0]), float(p[1])] for p in world_outer],
+        world_holes=[[[float(p[0]), float(p[1])] for p in wh] for wh in world_holes],
+        errors=[],
+    )

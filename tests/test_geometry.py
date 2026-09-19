@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from app.geometry import (  # noqa: E402
     convex_ordered_quad,
     measure_polygon,
+    measure_region,
     polygon_self_intersects,
     solve_homography,
 )
@@ -103,6 +104,75 @@ if res.ok:
     bt_img = [project(0, 0), project(100, 60), project(100, 0), project(0, 60)]
     m = measure_polygon(res.H, bt_img)
     check("self-intersecting polygon blocked", not m.ok and "自交" in m.errors[0])
+
+print("== regions with holes (world-coordinate ring relations) ==")
+Hm = res.H if res.ok else None
+if Hm:
+    # outer [10,90] x [10,50] -> area 80*40=3200, perim 240
+    outer = [project(10, 10), project(90, 10), project(90, 50), project(10, 50)]
+    # hole [20,30] x [20,30] -> area 100, perim 40
+    hole = [project(20, 20), project(30, 20), project(30, 30), project(20, 30)]
+    m = measure_region(Hm, outer, [hole])
+    check("region valid", m.ok, str(m.errors))
+    check("net area 3100", m.ok and abs(m.area - 3100) < 1e-4, f"area={m.area}")
+    check("total perim 280", m.ok and abs(m.perimeter - 280) < 1e-4, f"p={m.perimeter}")
+    check("outer area 3200", m.ok and abs(m.outer_area - 3200) < 1e-4)
+    check("hole area 100", m.ok and abs(m.hole_areas[0] - 100) < 1e-4)
+    check("world holes returned", m.ok and len(m.world_holes) == 1)
+
+    # two separate holes: each area 100, perim 40
+    hole2 = [project(40, 20), project(50, 20), project(50, 30), project(40, 30)]
+    m = measure_region(Hm, outer, [hole, hole2])
+    check("two holes valid", m.ok and abs(m.area - 3000) < 1e-4
+          and abs(m.perimeter - 320) < 1e-4, f"area={m.area} p={m.perimeter}")
+
+    # tangent to outer edge (shares edge y=10)
+    t = [project(20, 5), project(30, 5), project(30, 10), project(20, 10)]
+    m = measure_region(Hm, outer, [t])
+    check("tangent outer rejected", not m.ok and "相切" in m.errors[0], m.errors)
+
+    # vertex sitting on outer boundary
+    b = [project(20, 20), project(90, 30), project(20, 40)]
+    m = measure_region(Hm, outer, [b])
+    check("boundary vertex rejected", not m.ok
+          and ("相切" in m.errors[0] or "相交" in m.errors[0]), m.errors)
+
+    # hole outside the outer ring
+    o = [project(92, 20), project(98, 20), project(98, 30), project(92, 30)]
+    m = measure_region(Hm, outer, [o])
+    check("outside hole rejected", not m.ok and "之外" in m.errors[0], m.errors)
+
+    # holes touching each other (shared point)
+    a1 = [project(20, 20), project(30, 20), project(30, 30), project(20, 30)]
+    a2 = [project(30, 25), project(40, 25), project(40, 35), project(30, 35)]
+    m = measure_region(Hm, outer, [a1, a2])
+    check("touching holes rejected", not m.ok and "孔洞 1 与孔洞 2" in m.errors[0], m.errors)
+
+    # nested holes
+    n1 = [project(15, 15), project(85, 15), project(85, 45), project(15, 45)]
+    n2 = [project(20, 20), project(30, 20), project(30, 30), project(20, 30)]
+    m = measure_region(Hm, outer, [n1, n2])
+    check("nested holes rejected", not m.ok and "包含" in " ".join(m.errors), m.errors)
+
+    # degenerate (collinear) hole
+    d = [project(20, 20), project(30, 20), project(40, 20)]
+    m = measure_region(Hm, outer, [d])
+    check("degenerate hole rejected", not m.ok and "面积为 0" in m.errors[0], m.errors)
+
+    # self-crossing hole
+    sc = [project(20, 20), project(40, 40), project(40, 20), project(20, 40)]
+    m = measure_region(Hm, outer, [sc])
+    check("self-cross hole rejected", not m.ok and any("自交" in e for e in m.errors), m.errors)
+
+# identity-H direct cases (error message wording)
+ident = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+m = measure_region(ident, [[0, 0], [10, 0], [10, 10], [0, 10]],
+                   [[[2, 2], [4, 2], [4, 4], [2, 4]]])
+check("identity net area", m.ok and abs(m.area - 96) < 1e-9 and abs(m.perimeter - 48) < 1e-9)
+m = measure_region(ident, [[0, 0], [10, 0]], [])
+check("too few outer verts", not m.ok and "外环" in m.errors[0])
+m = measure_region(ident, [[0, 0], [10, 0], [10, 10]], [[[1, 1], [2, 1]]])
+check("too few hole verts", not m.ok and any("孔洞 1" in e for e in m.errors), m.errors)
 
 print()
 if failures:
